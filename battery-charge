@@ -1,0 +1,245 @@
+#!/usr/bin/python3
+"""Show battery and power readings in Omarchy's bar or change the cap with polkit."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+BATTERY = Path('/sys/class/power_supply/macsmc-battery')
+HWMON = Path('/sys/class/hwmon')
+THRESHOLD = BATTERY / 'charge_control_end_threshold'
+PROC = Path('/proc')
+
+
+def read_sysfs(path):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ''
+
+
+def read_millionths(path):
+    try:
+        return abs(int(read_sysfs(path))) / 1_000_000
+    except ValueError:
+        return None
+
+
+def read_watts(path):
+    return read_millionths(path)
+
+
+def format_watts(value):
+    return 'Unavailable' if value is None else f'{value:.1f} W'
+
+
+def status():
+    limit = read_sysfs(THRESHOLD)
+    if limit not in ('80', '100'):
+        limit = ''
+    capacity = read_sysfs(BATTERY / 'capacity')
+    state = read_sysfs(BATTERY / 'status')
+    sensors = {}
+    for device in HWMON.glob('hwmon*'):
+        if read_sysfs(device / 'name') == 'macsmc_hwmon':
+            for label in device.glob('power*_label'):
+                sensors[read_sysfs(label)] = label.with_name(label.name.replace('_label', '_input'))
+            break
+
+    samples = {'charger': [], 'system': [], 'battery': []}
+    for index in range(5):
+        for name, path in (
+            ('charger', sensors.get('AC Input Power')),
+            ('system', sensors.get('Total System Power')),
+            ('battery', BATTERY / 'power_now'),
+        ):
+            value = read_watts(path) if path else None
+            if value is not None:
+                samples[name].append(value)
+        if index < 4:
+            time.sleep(0.1)
+
+    capacity = int(capacity) if capacity.isdecimal() else None
+    charger_watts = sum(samples['charger']) / len(samples['charger']) if samples['charger'] else None
+    system_watts = sum(samples['system']) / len(samples['system']) if samples['system'] else None
+    battery_watts = sum(samples['battery']) / len(samples['battery']) if samples['battery'] else None
+    start = read_sysfs(BATTERY / 'charge_control_start_threshold')
+    adapter = BATTERY.parent / 'macsmc-ac'
+    ac_online = read_sysfs(adapter / 'online')
+    charger_limit = read_watts(adapter / 'input_power_limit') if ac_online == '1' else None
+    battery = f'Battery {capacity}%' if capacity is not None else 'Battery percentage unavailable'
+    if limit:
+        mode = 'Home' if limit == '80' else 'Travel'
+        cap = f'{mode} cap {limit}%'
+        action = 'Click for Travel — 100%' if limit == '80' else 'Click for Home — 80%'
+    else:
+        cap = 'Charge limit unavailable'
+        action = ''
+
+    battery_flow = 'Battery discharge' if state == 'Discharging' else 'Battery charge'
+    if state in ('', 'Unknown'):
+        battery_flow = 'Battery power'
+    lines = [
+        f'{battery} · {cap}',
+        '',
+        f'Charger input  {format_watts(charger_watts)}',
+        f'System draw  {format_watts(system_watts)}',
+        f'{battery_flow}  {format_watts(battery_watts)}',
+    ]
+    if state in ('Not charging', 'Full'):
+        lines.append(state)
+    if action:
+        lines.extend(('', action))
+    return {
+        'text': f'{limit}% cap' if limit else 'Cap ?',
+        'tooltip': '\n'.join(lines),
+        'capacity': capacity,
+        'energyWh': read_millionths(BATTERY / 'energy_now'),
+        'limit': limit,
+        'resumeBelow': int(start) if start.isdecimal() else None,
+        'state': state,
+        'acOnline': ac_online == '1' if ac_online in ('0', '1') else None,
+        'chargerWatts': charger_watts,
+        'chargerLimitWatts': charger_limit or None,
+        'systemWatts': system_watts,
+        'batteryWatts': battery_watts,
+    }
+
+
+def app_counters():
+    processes = {}
+    clients = {}
+    uid = os.getuid()
+    own_pid = str(os.getpid())
+    for process in PROC.iterdir():
+        if not process.name.isdecimal() or process.name == own_pid:
+            continue
+        try:
+            if process.stat().st_uid != uid:
+                continue
+            stat = (process / 'stat').read_text(errors='replace')
+            name, _, fields = stat.partition(' (')[2].rpartition(') ')
+            fields = fields.split()
+            # Fields 14, 15 and 22, relative to field 3 after the comm.
+            ticks = int(fields[11]) + int(fields[12])
+            started = int(fields[19])
+        except (OSError, IndexError, ValueError):
+            continue
+        try:
+            name = Path(os.readlink(process / 'exe')).name.removesuffix(' (deleted)')
+        except OSError:
+            pass
+        processes[process.name, started] = (name, ticks)
+
+        try:
+            for descriptor in (process / 'fd').iterdir():
+                try:
+                    target = os.readlink(descriptor)
+                except OSError:
+                    continue
+                if not target.startswith('/dev/dri/'):
+                    continue
+                info = process / 'fdinfo' / descriptor.name
+                values = dict(line.split(':', 1) for line in read_sysfs(info).splitlines()
+                              if line.startswith('drm-') and ':' in line)
+                if values.get('drm-driver', '').strip() not in ('aurora', 'asahi') or 'drm-client-id' not in values:
+                    continue
+                key = (values['drm-driver'], values.get('drm-pdev'), values['drm-client-id'])
+                if key in clients:
+                    # Duplicate descriptors count once. Skip clients shared across apps.
+                    if clients[key][0] != name:
+                        clients[key] = (None, {})
+                    continue
+                engines = {}
+                for field, value in values.items():
+                    if field.startswith('drm-engine-') and value.endswith(' ns'):
+                        engines[field] = int(value.removesuffix(' ns'))
+                clients[key] = (name, engines)
+        except (OSError, ValueError):
+            continue
+    return processes, clients
+
+
+def app_activity(previous, current, elapsed):
+    old_processes, old_clients = previous
+    processes, clients = current
+    cpu = {}
+    gpu = {}
+    for pid, (name, ticks) in processes.items():
+        old_name, old_ticks = old_processes.get(pid, (None, 0))
+        if name == old_name and ticks >= old_ticks:
+            cpu[name] = cpu.get(name, 0) + ticks - old_ticks
+
+    for client, (name, engines) in clients.items():
+        old_name, old_engines = old_clients.get(client, (None, {}))
+        if name is None or name != old_name:
+            continue
+        for engine, ns in engines.items():
+            if engine not in old_engines:
+                continue
+            # DRM counters may briefly step back. Retain the last high value.
+            engines[engine] = max(ns, old_engines[engine])
+            totals = gpu.setdefault(name, {})
+            totals[engine] = totals.get(engine, 0) + engines[engine] - old_engines[engine]
+
+    tick_scale = 100 / (elapsed * os.sysconf('SC_CLK_TCK'))
+    gpu_scale = 100 / (elapsed * 1_000_000_000)
+    rows = []
+    for name in cpu.keys() | gpu.keys():
+        cpu_percent = round(cpu.get(name, 0) * tick_scale)
+        gpu_percent = round(max(gpu[name].values()) * gpu_scale) if name in gpu else None
+        if cpu_percent or gpu_percent:
+            rows.append({'name': name, 'cpu': cpu_percent, 'gpu': gpu_percent})
+    rows.sort(key=lambda row: (-max(row['cpu'], row['gpu'] or 0), row['name'].casefold()))
+    return rows[:4]
+
+
+def watch_apps():
+    previous = app_counters()
+    sampled_at = time.monotonic()
+    while True:
+        time.sleep(2)
+        current = app_counters()
+        now = time.monotonic()
+        print(json.dumps(app_activity(previous, current, now - sampled_at)), flush=True)
+        previous, sampled_at = current, now
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) == 2 else ''
+    if action == 'status':
+        print(json.dumps(status()))
+        return 0
+    if action == 'apps':
+        watch_apps()
+        return 0
+    if action == 'toggle':
+        try:
+            current = THRESHOLD.read_text().strip()
+            if current not in ('80', '100'):
+                raise ValueError('Unsupported charge limit')
+            action = '100' if current == '80' else '80'
+        except (OSError, ValueError) as error:
+            print(f'Cannot read charge limit: {error}', file=sys.stderr)
+            subprocess.run(['/usr/bin/notify-send', '-u', 'critical', 'Charge limit unavailable',
+                            'Could not read the current battery charge limit.'])
+            return 1
+    if action not in ('80', '100'):
+        print('Usage: battery-charge status|apps|toggle|80|100', file=sys.stderr)
+        return 2
+    result = subprocess.run(['/usr/bin/pkexec', '/usr/local/libexec/dotfiles-set-charge-limit', action])
+    if result.returncode in (126, 127):
+        # Cancelled or denied: do not retry or announce success.
+        return result.returncode
+    if result.returncode:
+        subprocess.run(['/usr/bin/notify-send', '-u', 'critical', 'Charge limit unchanged', 'Could not apply the charge limit. Try clicking the battery-care glyph again.'])
+        return result.returncode
+    subprocess.run(['/usr/bin/notify-send', 'Battery charge limit', f'Set to {action}% (saved across restarts).'])
+    subprocess.run(['omarchy-menu', 'refresh'], check=False)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
