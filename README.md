@@ -5,6 +5,12 @@ Arch Linux ARM and Omarchy's Quickshell bar.
 
 ![Power Flow showing the charge limit and app activity](power-flow.png)
 
+These examples use simulated readings.
+
+| Battery power | Battery charging | Charger and battery |
+| --- | --- | --- |
+| ![Battery supplying the Mac](screenshots/battery.png) | ![Charger powering the Mac and charging the battery](screenshots/charging.png) | ![Charger and battery jointly powering the Mac](screenshots/charger-battery.png) |
+
 ## Install
 
 Requires Omarchy with Quickshell, Python 3, polkit, TLP, and an Apple Silicon
