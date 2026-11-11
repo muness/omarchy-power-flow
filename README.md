@@ -79,3 +79,11 @@ and the marked battery block from the menu extension. Remove
 Verification: `python3 -m unittest discover -p 'test_*.py'`.
 
 Licensed under the [MIT License](LICENSE).
+
+## Power connection warnings
+
+The installed user service warns about unusually frequent battery and AC events,
+or a detected USB-C power source while the battery drains at least 5 W for a
+minute. Warnings are limited to one per ten minutes. They cannot identify a bad
+cable or detect a cable that the system cannot see. Disable with
+`systemctl --user disable --now power-warning.service`.
